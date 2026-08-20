@@ -30,6 +30,16 @@ CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
 
 
+def ensure_dataset_downloaded(rank: int) -> None:
+    """
+    Only rank 0 downloads CIFAR-10. Must be called and completed BEFORE the
+    barrier below, otherwise other ranks race ahead and try to read a
+    dataset that hasn't finished downloading yet.
+    """
+    if rank == 0:
+        datasets.CIFAR10(root="./data", train=True, download=True)
+
+
 def get_dataloader(rank: int, world_size: int, batch_size: int = 128) -> DataLoader:
     transform = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -38,9 +48,10 @@ def get_dataloader(rank: int, world_size: int, batch_size: int = 128) -> DataLoa
         transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
     ])
 
-    # Only rank 0 downloads to avoid a thundering herd of simultaneous
-    # downloads; other ranks wait via a barrier after setup() is called.
-    dataset = datasets.CIFAR10(root="./data", train=True, download=(rank == 0), transform=transform)
+    # By this point the dataset is guaranteed to already be on disk (see
+    # ensure_dataset_downloaded + barrier in train_worker), so every rank
+    # can safely use download=False here.
+    dataset = datasets.CIFAR10(root="./data", train=True, download=False, transform=transform)
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=2, drop_last=True)
@@ -51,7 +62,9 @@ def train_worker(rank: int, world_size: int, epochs: int) -> None:
     setup(rank, world_size)
 
     import torch.distributed as dist
-    dist.barrier()  # make sure rank 0 finished downloading before others read the dataset
+
+    ensure_dataset_downloaded(rank)
+    dist.barrier()  # all ranks wait here until rank 0's download above is fully done
 
     device = get_device(rank)
     loader = get_dataloader(rank, world_size)
