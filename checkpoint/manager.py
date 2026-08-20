@@ -107,6 +107,18 @@ def checkpoint_path(checkpoint_dir: str, global_step: int) -> str:
     return os.path.join(checkpoint_dir, f"ckpt_step{global_step:08d}.pt")
 
 
+def list_checkpoints(checkpoint_dir: str) -> List[str]:
+    """
+    Every checkpoint in the directory, oldest first.
+
+    Recovery needs the whole list, not just the newest: if the newest one is
+    truncated — a worker killed mid-write, which is the exact failure mode
+    Phase 3 injects — it has to fall back to the previous one rather than
+    give up.
+    """
+    return sorted(glob.glob(os.path.join(checkpoint_dir, _CKPT_GLOB)))
+
+
 def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     """
     Newest checkpoint in `checkpoint_dir`, or None.

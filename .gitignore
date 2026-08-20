@@ -19,3 +19,4 @@ wandb/
 .pytest_cache/
 results/repro/
 results/failure_log.jsonl
+results/jobs/

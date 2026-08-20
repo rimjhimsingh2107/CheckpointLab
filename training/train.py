@@ -48,6 +48,7 @@ from checkpoint.manager import (
     restore_rng_state,
     save_checkpoint,
 )
+from controller.worker_manager import write_heartbeat
 from failures.injector import (
     DEFAULT_FAILURE_LOG,
     INJECTED_EXIT_CODE,
@@ -108,6 +109,25 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "derived from the rate and seed, so the two launches "
                         "of one interrupted job share it.")
 
+    p.add_argument("--job-dir", default=None,
+                   help="Per-job directory. When set, the checkpoint dir, "
+                        "failure log, heartbeat dir and run id all default to "
+                        "paths underneath it, so two jobs can never share "
+                        "state by accident.")
+    p.add_argument("--rank", type=int, default=-1,
+                   help="Run as a SINGLE rank in this process instead of "
+                        "self-spawning the world. This is how the Phase 4 "
+                        "controller launches workers it wants to monitor "
+                        "individually. -1 = launcher mode (mp.spawn).")
+    p.add_argument("--generation", type=int, default=0,
+                   help="Which restart generation this worker belongs to. "
+                        "Stamped into heartbeats so the controller can't "
+                        "read a dead generation's as live.")
+    p.add_argument("--heartbeat-dir", default=None,
+                   help="Where to write liveness heartbeats")
+    p.add_argument("--heartbeat-every", type=int, default=1,
+                   help="Touch the heartbeat every N steps")
+
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--master-port", type=int, default=0,
                    help="Rendezvous port. 0 = pick a free ephemeral port, "
@@ -135,6 +155,38 @@ def pick_master_port(requested: int) -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
         return str(sock.getsockname()[1])
+
+
+def apply_job_dir(args: argparse.Namespace) -> argparse.Namespace:
+    """
+    Derive per-job paths from --job-dir, without clobbering explicit flags.
+
+    Phase 3 left a sharp edge: the failure log defaulted to one shared path
+    and already-fired steps were matched on a run id derived from the rate
+    and seed, so two jobs with the same rate and seed would suppress each
+    other's failures. Scoping every piece of per-job state under a unique
+    directory removes the collision by construction rather than asking the
+    caller to remember four separate flags.
+    """
+    if not args.job_dir:
+        return args
+
+    defaults = argparse.Namespace(**vars(parse_args([])))
+
+    if args.checkpoint_dir == defaults.checkpoint_dir:
+        args.checkpoint_dir = os.path.join(args.job_dir, "checkpoints")
+    if args.failure_log == defaults.failure_log:
+        args.failure_log = os.path.join(args.job_dir, "failure_log.jsonl")
+    if args.heartbeat_dir is None:
+        args.heartbeat_dir = os.path.join(args.job_dir, "heartbeats")
+    if args.run_id is None:
+        # The job directory name IS the job identity, so failures recorded by
+        # one job can never be read as another's.
+        args.run_id = os.path.basename(os.path.normpath(args.job_dir))
+    if args.loss_log is None:
+        args.loss_log = os.path.join(args.job_dir, "loss_log.jsonl")
+
+    return args
 
 
 def resolve_world_size(requested: int) -> int:
@@ -310,6 +362,16 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     loss_log = LossLog(args.loss_log, args.launch_id) if (args.loss_log and rank == 0) else None
 
+    def beat(step_now: int, epoch_now: int, state: str = "training") -> None:
+        if args.heartbeat_dir:
+            write_heartbeat(args.heartbeat_dir, rank,
+                            generation=args.generation, global_step=step_now,
+                            epoch=epoch_now, state=state)
+
+    # Emitted before the first step so the controller can tell "still loading
+    # a checkpoint" apart from "hung on startup".
+    beat(global_step, start_epoch, state="starting")
+
     if rank == 0:
         print(f"[rank {rank}] Starting training: world_size={world_size}, "
               f"device={device}, backend={ddp_backend}, epochs={args.epochs}, "
@@ -377,6 +439,9 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                                step_in_epoch=step, loss=global_loss,
                                rank0_loss=local_loss.item())
 
+            if args.heartbeat_every and global_step % args.heartbeat_every == 0:
+                beat(global_step, epoch)
+
             if rank == 0 and (step % args.log_every == 0 or step == 1):
                 print(f"[epoch {epoch}] step {step}/{steps_per_epoch} "
                       f"global_step={global_step} loss={global_loss:.6f}")
@@ -433,13 +498,38 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 print(f"[rank {rank}] hit --max-steps={args.max_steps}, stopping")
             break
 
+    beat(global_step, args.epochs - 1, state="finished")
+
     if loss_log is not None:
         loss_log.close()
     cleanup()
 
 
 def main(argv=None) -> None:
-    args = parse_args(argv)
+    args = apply_job_dir(parse_args(argv))
+
+    # ---- worker mode -------------------------------------------------
+    # One rank, in this process, no mp.spawn. The controller spawns N of
+    # these so it can watch each rank as its own OS process; mp.spawn tears
+    # the whole world down on the first failure, which leaves nobody to
+    # notice or restart anything.
+    if args.rank >= 0:
+        if args.world_size < 1:
+            raise SystemExit("--rank requires an explicit --world-size")
+        if args.master_port <= 0:
+            raise SystemExit(
+                "--rank requires an explicit --master-port: every rank of a "
+                "world must rendezvous on the same port, and each picking "
+                "its own free port would never meet")
+
+        os.environ["MASTER_PORT"] = str(args.master_port)
+        print(f"[rank {args.rank}] worker mode: world_size={args.world_size}, "
+              f"port={args.master_port}, generation={args.generation}")
+        train_worker(args.rank, args.world_size, args)
+        print(f"[rank {args.rank}] worker finished")
+        return
+
+    # ---- launcher mode (unchanged) -----------------------------------
     world_size = resolve_world_size(args.world_size)
 
     # Set before spawn so every child inherits the same rendezvous point
