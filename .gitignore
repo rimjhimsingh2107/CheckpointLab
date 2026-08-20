@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+results/*.pt
+results/*.ckpt
+*.ckpt
+.env
+wandb/
+.DS_Store
+*.egg-info/
+.pytest_cache/
