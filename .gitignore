@@ -17,3 +17,5 @@ wandb/
 .DS_Store
 *.egg-info/
 .pytest_cache/
+results/repro/
+results/failure_log.jsonl

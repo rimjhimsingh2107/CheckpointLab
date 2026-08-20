@@ -48,6 +48,13 @@ from checkpoint.manager import (
     restore_rng_state,
     save_checkpoint,
 )
+from failures.injector import (
+    DEFAULT_FAILURE_LOG,
+    INJECTED_EXIT_CODE,
+    FailureSchedule,
+    load_fired_steps,
+    log_failure,
+)
 
 
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
@@ -86,6 +93,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--crash-at-step", type=int, default=0,
                    help="Simulate a hard worker crash (os._exit) right after "
                         "this global step. 0 = never.")
+    p.add_argument("--failure-rate", type=float, default=0.0,
+                   help="Per-step probability a worker is killed "
+                        "(0 = failure injection off)")
+    p.add_argument("--failure-seed", type=int, default=42,
+                   help="Seed for the failure schedule. Same seed => same "
+                        "failures at the same steps, always.")
+    p.add_argument("--failure-log", default=DEFAULT_FAILURE_LOG,
+                   help="JSONL log of every injected failure")
+    p.add_argument("--failure-min-step", type=int, default=1,
+                   help="Don't inject failures before this global step")
+    p.add_argument("--run-id", default=None,
+                   help="Tags failure-log records. Defaults to a value "
+                        "derived from the rate and seed, so the two launches "
+                        "of one interrupted job share it.")
+
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--master-port", type=int, default=0,
                    help="Rendezvous port. 0 = pick a free ephemeral port, "
@@ -178,6 +200,22 @@ def get_dataloader(rank: int, world_size: int, args: argparse.Namespace) -> Data
                       num_workers=num_workers, drop_last=True)
 
 
+def hard_kill(reason: str, rank: int, global_step: int,
+              loss_log: "LossLog | None", exit_code: int) -> None:
+    """
+    Die the way a preempted or OOM-killed worker dies.
+
+    os._exit, not sys.exit: no atexit handlers, no buffered output flushed,
+    no process-group teardown. A real cluster failure doesn't get to run
+    cleanup code either, and a simulated one that does would let bugs hide
+    behind orderly shutdown.
+    """
+    print(f"[rank {rank}] {reason} at global_step={global_step}", flush=True)
+    if loss_log is not None:
+        loss_log.close()
+    os._exit(exit_code)
+
+
 class LossLog:
     """Line-buffered JSONL writer for per-step losses (rank 0 only)."""
 
@@ -191,7 +229,7 @@ class LossLog:
     def write(self, **record) -> None:
         record["launch"] = self._launch_id
         self._fh.write(json.dumps(record) + "\n")
-        # Flushed every line on purpose: --crash-at-step uses os._exit(),
+        # Flushed every line on purpose: the kill paths use os._exit(),
         # which skips all buffer flushing. Anything still buffered when a
         # worker dies is exactly the data we need to prove the resume.
         self._fh.flush()
@@ -246,6 +284,29 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         elif rank == 0:
             print(f"[rank {rank}] No checkpoint in {args.checkpoint_dir}; "
                   f"starting from scratch")
+
+    # ---------------- failure injection ----------------
+    # The schedule needs a step budget up front. Because each step's outcome
+    # is an independent hash of (seed, step), widening this bound can only
+    # append failures, never change the ones already scheduled.
+    schedule_horizon = args.max_steps or (args.epochs * steps_per_epoch)
+    schedule = FailureSchedule(args.failure_rate, world_size, args.failure_seed,
+                               schedule_horizon, min_step=args.failure_min_step)
+    run_id = args.run_id or f"rate{args.failure_rate}-seed{args.failure_seed}"
+
+    # Steps that already killed a worker on an earlier launch of this job.
+    # Recovery replays work, so without this the schedule would fire again
+    # at the step it just died on and the job would never make progress.
+    already_fired = (load_fired_steps(args.failure_log, run_id)
+                     if args.failure_rate > 0 else set())
+
+    if args.failure_rate > 0 and rank == 0:
+        print(f"[rank {rank}] failure injection ON: {schedule.describe()}")
+        print(f"[rank {rank}] scheduled failures: "
+              f"{[(f.step, f.worker) for f in schedule.failures]}")
+        if already_fired:
+            print(f"[rank {rank}] already fired on a previous launch, "
+                  f"will not re-fire: {sorted(already_fired)}")
 
     loss_log = LossLog(args.loss_log, args.launch_id) if (args.loss_log and rank == 0) else None
 
@@ -320,6 +381,28 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 print(f"[epoch {epoch}] step {step}/{steps_per_epoch} "
                       f"global_step={global_step} loss={global_loss:.6f}")
 
+            # Both kill paths sit BEFORE the checkpoint block on purpose. A
+            # failure at step N must lose step N's work, otherwise a failure
+            # that happens to land on a checkpoint step costs nothing and
+            # Phase 6's benchmark would understate what failures really cost.
+            if args.crash_at_step and global_step >= args.crash_at_step:
+                hard_kill("SIMULATED CRASH", rank, global_step, loss_log, 137)
+
+            victim = schedule.victim_at(global_step)
+            if victim is not None and global_step not in already_fired:
+                if rank == victim:
+                    log_failure(args.failure_log, step=global_step,
+                                worker=rank, schedule=schedule, run_id=run_id,
+                                extra={"epoch": epoch, "step_in_epoch": step,
+                                       "loss": global_loss})
+                    hard_kill(f"INJECTED FAILURE (worker {victim})", rank,
+                              global_step, loss_log, INJECTED_EXIT_CODE)
+                elif rank == 0:
+                    # Logged by the victim, but the survivors' transcript
+                    # should say why the job is about to go down.
+                    print(f"[rank {rank}] worker {victim} is being killed at "
+                          f"global_step={global_step}", flush=True)
+
             if args.checkpoint_every and global_step % args.checkpoint_every == 0:
                 # A checkpoint taken at the end of an epoch records
                 # (epoch+1, 0) rather than (epoch, steps_per_epoch): the
@@ -335,17 +418,6 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 if rank == 0:
                     print(f"[epoch {epoch}] checkpoint @ global_step="
                           f"{global_step} ({dur * 1000:.0f} ms)")
-
-            if args.crash_at_step and global_step >= args.crash_at_step:
-                if rank == 0:
-                    print(f"[rank {rank}] SIMULATED CRASH at global_step="
-                          f"{global_step}", flush=True)
-                if loss_log is not None:
-                    loss_log.close()
-                # os._exit, not sys.exit: no atexit handlers, no buffer
-                # flush, no process-group teardown. A real preemption or
-                # OOM-kill doesn't get to run cleanup code either.
-                os._exit(137)
 
             if args.max_steps and global_step >= args.max_steps:
                 stop = True
