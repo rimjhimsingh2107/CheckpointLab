@@ -14,6 +14,10 @@
 #
 #   --profile test     the test suite, inside the image.
 #
+#   --profile monitor  exporter + Prometheus + Grafana. Long-lived;
+#                      bring it up first, then run a train/recover
+#                      profile alongside it to generate activity.
+#
 # WHY `recover` IS ONE CONTAINER AND `train` IS TWO
 #
 # controller/worker_manager.py supervises ranks with subprocess.Popen and
@@ -135,6 +139,75 @@ services:
       MASTER_ADDR: localhost
       PYTHONUNBUFFERED: "1"
     command: ["pytest", "-m", "not slow", "-q"]
+
+  # -------------------------------------------------------------- monitor
+  #
+  # WHY THE EXPORTER IS A SEPARATE LONG-LIVED SERVICE
+  #
+  # The workers are killed on purpose and repeatedly. A scrape target has to
+  # be present when Prometheus arrives, so it cannot live inside a process
+  # that is designed to die -- an in-process exporter would produce a
+  # sawtooth of target-down gaps and counters resetting to zero on every
+  # restart. This reads the durable JSONL instead, so the metrics outlive the
+  # workers that produced them.
+  exporter:
+    <<: *worker
+    profiles: [monitor]
+    container_name: ckpt-exporter
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # Read-only: the exporter observes, it never writes. The training
+      # containers mount the same path rw.
+      - ../results:/app/results:ro
+    ports:
+      - "9101:9101"
+    command:
+      - python
+      - -m
+      - metrics.prometheus
+      - --results-root=/app/results
+      - --port=9101
+
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    profiles: [monitor]
+    container_name: ckpt-prometheus
+    depends_on: [exporter]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # These jobs last ~30-60s, so the useful retention is minutes. Keeping
+      # it small means `down -v` is genuinely cheap to redo.
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    networks: [ckpt]
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    profiles: [monitor]
+    container_name: ckpt-grafana
+    depends_on: [prometheus]
+    ports:
+      - "3000:3000"
+    environment:
+      # Anonymous admin: this is a local demo stack on a bridge network with
+      # no data worth protecting, and a login wall between a reader and the
+      # dashboard is the main reason nobody looks at it. Do NOT copy this to
+      # anything reachable.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "light"
+      # Land straight on the dashboard instead of the Grafana welcome page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/checkpointlab.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks: [ckpt]
 
 networks:
   ckpt:

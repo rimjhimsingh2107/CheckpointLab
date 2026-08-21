@@ -31,3 +31,5 @@ results/demo/
 results/docker-train*/
 results/docker-recover/
 results/baremetal-train/
+# Monitoring demo jobs -- ~427 MB each (checkpoints).
+results/monitor-*/

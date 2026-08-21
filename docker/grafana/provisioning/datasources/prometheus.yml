@@ -1,0 +1,14 @@
+# Datasource provisioning. Fixed uid so the dashboard JSON can reference it
+# without a lookup -- a provisioned dashboard pointing at an auto-generated
+# uid is the usual reason a "working" dashboard renders as No data.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: checkpointlab-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 2s

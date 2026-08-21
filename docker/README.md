@@ -155,3 +155,149 @@ the adaptive scheduler as the part that's actually novel here.
 - **`TRAIN_RUN`** parameterizes the train profile's output dir, which is how
   `verify_docker.sh` runs the same profile twice to different directories to
   prove in-container determinism.
+
+---
+
+# Monitoring: Prometheus + Grafana
+
+```bash
+# 1. bring up the monitoring stack (long-lived)
+docker compose -f docker/docker-compose.yml --profile monitor up -d
+
+# 2. generate some activity alongside it
+docker compose -f docker/docker-compose.yml --profile recover run --rm controller \
+  python controller/recovery.py \
+    --job-dir=/app/results/my-run --world-size=2 --epochs=8 \
+    --batch-size=32 --subset-size=1024 --max-steps=30 \
+    --checkpoint-every=4 --adaptive-checkpointing \
+    --failure-rate=0.15 --failure-seed=11 --max-restarts=20 --log-every=1000
+
+# 3. look at it
+open http://localhost:3000        # Grafana, anonymous admin, lands on the dashboard
+open http://localhost:9090        # Prometheus
+curl localhost:9101/metrics       # the exporter directly
+
+# 4. verify the whole chain instead of trusting it
+bash docker/verify_monitoring.sh
+```
+
+| service | port | image |
+|---|---|---|
+| `exporter` | 9101 | `checkpointlab:local` (`python -m metrics.prometheus`) |
+| `prometheus` | 9090 | `prom/prometheus:v3.4.1` |
+| `grafana` | 3000 | `grafana/grafana:11.6.0` |
+
+## Why the exporter is a sidecar, not in-process instrumentation
+
+The obvious design is to import `prometheus_client` into `training/train.py`
+and increment counters as steps complete. That is wrong *for this project*:
+the workers are killed on purpose, repeatedly, and a scrape target has to be
+there when Prometheus arrives. An in-process exporter would vanish mid-run on
+every injected failure, and the scrape history would be target-down gaps
+punctuated by counters resetting to zero on each restart.
+
+So `metrics/prometheus.py` is a long-lived process that re-reads each job's
+durable JSONL on every scrape. Same insight Phase 5's scheduler rests on: the
+process that made an observation is the one that died, so the log on disk is
+the only source of truth that survives. It pays off twice here — the metrics
+outlive the workers, and counters stay monotonic across generations because
+they are recomputed from the whole log rather than accumulated in memory.
+A scrape costs ~3 ms (exposed as `checkpointlab_exporter_scrape_duration_seconds`),
+which is why `scrape_interval` can be 2s.
+
+## Verified, on this machine
+
+`bash docker/verify_monitoring.sh` — all five checks pass:
+
+```
+ 1/5  EXPORTER          226 checkpointlab samples, 8 jobs discovered
+ 2/5  PROMETHEUS TARGET checkpointlab health=up err=''
+ 3/5  SERIES PRESENT    ckpt_job values: [... 8 jobs ...]
+ 4/5  GRAFANA           11.6.0 database=ok; datasource -> http://prometheus:9090
+                        dashboard 'CheckpointLab — ...': 12 panels
+ 5/5  GRAFANA QUERIES   throughput/interval/recovery/active_failures: 8 series each
+```
+
+Check 5 is the one that matters. A provisioned datasource that cannot reach
+Prometheus, or a dashboard whose selectors don't match the exported labels,
+both present as an empty panel with **no error anywhere**. Querying through
+Grafana's own datasource proxy is the only way to prove the path a panel
+actually takes.
+
+### Activity used for the screenshots
+
+A containerized adaptive run, 30 steps, `--failure-rate=0.15 --failure-seed=11`
+— 5 scheduled failures at steps 8, 10, 11, 15, 22. All 5 fired and all 5
+recovered; the job completed with both ranks exiting 0:
+
+```
+   #  rank   kind   died@  restored@  lost  recovery s
+   1     1   exit       8          7     1        7.66
+   2     0   exit      10          9     1        6.51
+   3     0   exit      11         10     1        6.50
+   4     0   exit      15         14     1        7.10
+   5     1   exit      22         21     1        8.63
+```
+
+### What the dashboard actually shows
+
+Viewed in a browser at `localhost:3000`, job filtered to this run. Described
+rather than embedded as a PNG — see the caveat below.
+
+- **Stat row** — Active failures `0` (green, with visible red spikes in the
+  sparkline where recoveries were in flight), Throughput `0.70`, Last recovery
+  `5.82 s`, Checkpoint interval `1`, Recoveries `5`.
+- **Throughput over time** — flat zero until 15:59, then a climb from ~0.35 to
+  0.70 steps/sec with small notches at the recovery points.
+- **Checkpoint interval over time** — two series. Interval-in-steps (green,
+  stepped) starts at 4, the launch value, then sits at 1. T\* in seconds
+  (yellow) swings 2.9 → 1.2 and oscillates around 1.4 as the scheduler
+  re-estimates. Seeing them disagree is the point: it is the integer
+  quantization from Phase 5, on screen.
+- **Recovery duration split by phase** — `reach_first_step` (yellow) fills
+  5.5–6.5 s while the other three phases sit flat near zero. This is the
+  Phase 6 finding rendered: ~96% of recovery is process startup, not
+  controller logic. A panel showing only the total would send you optimizing
+  the wrong thing.
+- **Useful vs recomputed work** — useful steps climbing to 30, recomputed
+  climbing to 5, one per failure.
+
+### Caveats, stated rather than glossed
+
+- **No PNG of the dashboard is committed.** Server-side rendering needs the
+  `grafana-image-renderer` plugin, which is not installed. The dashboard was
+  confirmed by viewing it in a browser and by check 5 above; the description
+  is what it showed, not what it should show.
+- **Gauges freeze when a job ends, they do not fall to zero.** The exporter
+  reports the last value in the log, and a finished job's log stops changing —
+  so throughput reads `0.70` forever after completion rather than dropping.
+  `checkpointlab_job_active` is the metric that distinguishes running from
+  finished; filter on it before reading a gauge as "current".
+- **The interval panel shows little variation in-container.** Not a bug:
+  containerized throughput is ~0.4–0.7 steps/sec (two ranks plus the
+  controller sharing one container in a 4 GB VM), so a perfectly reasonable
+  T\* of 1–3 seconds converts to ~1 step. The `clamped` field in
+  `scheduler_log.jsonl` reads `-`, confirming the floor is not being hit —
+  the arithmetic really does land at 1. Interval variation is visible on bare
+  metal, where throughput is ~1.0 steps/sec (Phase 5 shows 2 → 3 → 4).
+- **Anonymous admin is on.** Local demo stack, bridge network, nothing worth
+  protecting, and a login wall is the main reason nobody looks at a dashboard.
+  Do not copy that setting anywhere reachable.
+
+## A bug worth recording: `job` is a reserved label
+
+The first version labelled every metric `job="<job dir>"`. Prometheus
+attaches its own `job` label from the scrape config, and with `honor_labels`
+at its default of `false` the *exporter's* version loses — it is silently
+renamed to `exported_job`. The result:
+
+- the scrape succeeded,
+- the target reported `health=up` with `lastError=''`,
+- Prometheus held all 27 metric names,
+- and every dashboard panel would have rendered **No data**, because
+  `job=~"$job"` matched `job="checkpointlab"` rather than the training job.
+
+Nothing anywhere reported an error. The fix was renaming the dimension to
+`ckpt_job` rather than setting `honor_labels: true` — the latter works but
+discards the scrape-job name, and `job` is reserved by convention for exactly
+that. `tests/test_prometheus_exporter.py` pins it so it cannot regress.

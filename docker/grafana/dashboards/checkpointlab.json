@@ -1,0 +1,890 @@
+{
+  "uid": "checkpointlab",
+  "title": "CheckpointLab \u2014 training, failures, recovery",
+  "description": "Live view of the CheckpointLab testbed. Metrics come from metrics/prometheus.py, which re-reads each job's JSONL logs on scrape because the training workers are killed on purpose and cannot host a scrape target themselves.",
+  "tags": [
+    "checkpointlab",
+    "phase7"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "checkpointlab-prom"
+        },
+        "query": {
+          "query": "label_values(checkpointlab_last_step, ckpt_job)",
+          "refId": "job-values"
+        },
+        "definition": "label_values(checkpointlab_last_step, ckpt_job)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active failures",
+      "description": "Failures detected but not yet recovered. Non-zero only DURING an incident, which is what makes it the alertable signal.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "max(checkpointlab_active_failures{ckpt_job=~\"$job\"})",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds",
+            "fixedColor": "#2a78d6"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#1baf7a",
+                "value": null
+              },
+              {
+                "color": "#e34948",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Throughput",
+      "description": "Steps/sec over the last 20 steps.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "max(checkpointlab_throughput_steps_per_second{ckpt_job=~\"$job\"})",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#2a78d6"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 4,
+        "y": 0
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Last recovery",
+      "description": "Most recent failure-detected to training-resumed duration.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "max(checkpointlab_recovery_duration_seconds{ckpt_job=~\"$job\"})",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#eb6834"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 9,
+        "y": 0
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Checkpoint interval",
+      "description": "Interval currently in effect, in steps (not the computed one).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "max(checkpointlab_checkpoint_interval_steps{ckpt_job=~\"$job\"})",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#1baf7a"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 14,
+        "y": 0
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Recoveries",
+      "description": "Completed crash-detect-restore-resume cycles.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "max(checkpointlab_recoveries_total{ckpt_job=~\"$job\"})",
+          "legendFormat": "",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#eda100"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 5,
+        "x": 19,
+        "y": 0
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Throughput over time",
+      "description": "Collapses to zero across a recovery -- the workers are gone, so no steps complete. The width of the trough IS the recovery cost.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_throughput_steps_per_second{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} steps/sec",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "pointSize": 8,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "none",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Checkpoint interval over time",
+      "description": "Interval in effect (steps, stepped) against the scheduler's target T* = sqrt(2dM) in seconds. Phase 6 found these can disagree, which is why both are plotted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_checkpoint_interval_steps{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} interval (steps)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_scheduler_optimal_interval_seconds{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} T* (seconds)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "pointSize": 8,
+            "spanNulls": false,
+            "lineInterpolation": "stepAfter"
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "none",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Recovery duration, split by phase",
+      "description": "~97% is reach_first_step: a fresh interpreter importing torch, rebuilding the model, loading the checkpoint. A dashboard showing only the total would send you optimising the controller instead.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_recovery_phase_seconds{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{phase}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "auto",
+            "pointSize": 8,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "terminate_workers"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#2a78d6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "select_checkpoint"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eb6834"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "relaunch_workers"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#1baf7a"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "reach_first_step"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#eda100"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Useful vs recomputed work",
+      "description": "Recomputed steps are work a crash discarded and the job had to redo -- the same definition the Phase 6 benchmark uses for wasted compute, so dashboard and benchmark cannot disagree.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_steps_completed_total{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} useful",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_steps_recomputed_total{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} recomputed",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "pointSize": 8,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "none",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Checkpoint write duration",
+      "description": "d in T* = sqrt(2dM). ~90 MB of weights plus SGD momentum.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_checkpoint_duration_seconds{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} last write",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "pointSize": 8,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 20
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Scheduler estimates",
+      "description": "Only populated under --adaptive-checkpointing. R lags one recovery behind by construction, so it reads 0 until the second recovery.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_scheduler_mtbf_seconds{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} MTBF (M)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_scheduler_recovery_cost_seconds{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} recovery cost (R)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "pointSize": 8,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 20
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Cumulative cost",
+      "description": "Where wall clock goes that is not useful compute.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "checkpointlab-prom"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_checkpoint_seconds_total{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} checkpointing",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_recovery_seconds_total{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} recovering",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "checkpointlab_fast_forward_seconds_total{ckpt_job=~\"$job\"}",
+          "legendFormat": "{{ckpt_job}} fast-forward",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "auto",
+            "pointSize": 8,
+            "spanNulls": false
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 20
+      }
+    }
+  ]
+}

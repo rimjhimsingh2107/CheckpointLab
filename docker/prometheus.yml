@@ -1,0 +1,23 @@
+# Prometheus config for the CheckpointLab monitor stack.
+
+global:
+  # 2s, which is far more aggressive than a production default. The jobs this
+  # watches run for ~30-60 seconds and the whole point is to see the recovery
+  # transient -- throughput collapsing to zero, active_failures going to 1,
+  # the interval being recomputed. At a 15s default a 6-second recovery could
+  # fall entirely between two scrapes and the dashboard would show a job that
+  # never faltered.
+  scrape_interval: 2s
+  evaluation_interval: 2s
+
+scrape_configs:
+  - job_name: checkpointlab
+    static_configs:
+      # Compose service name. The exporter re-reads the JSONL on each scrape,
+      # so it is cheap to poll this hard (~3 ms per scrape, exposed as
+      # checkpointlab_exporter_scrape_duration_seconds).
+      - targets: ['exporter:9101']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

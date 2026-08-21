@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: CheckpointLab
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    # Provisioned dashboards are read-only in the UI by default; allowing
+    # UI edits makes it easy to iterate live, but the file on disk stays the
+    # source of truth and wins on restart.
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
