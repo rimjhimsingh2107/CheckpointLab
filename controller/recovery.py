@@ -53,6 +53,12 @@ import torch
 
 from checkpoint.manager import FORMAT_VERSION, list_checkpoints
 from controller.worker_manager import WorkerFailure, WorkerManager
+from metrics.recovery_timing import (
+    RecoveryTiming,
+    format_breakdown,
+    load_recovery_timings,
+    summarize,
+)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_JOBS_ROOT = os.path.join("results", "jobs")
@@ -160,7 +166,7 @@ class RecoveryController:
             train_flags=["--job-dir", job_dir] + list(train_flags),
             heartbeat_timeout=heartbeat_timeout)
 
-        self.recoveries: List[dict] = []
+        self.recoveries: List[RecoveryTiming] = []
 
     def _say(self, message: str) -> None:
         if not self.quiet:
@@ -209,8 +215,9 @@ class RecoveryController:
             time.sleep(self.poll_interval)
         return None
 
-    def _recover(self, failure: WorkerFailure, attempt: int) -> Optional[dict]:
-        """Handle one failure. Returns timing detail, or None if unrecoverable."""
+    def _recover(self, failure: WorkerFailure,
+                 attempt: int) -> Optional[RecoveryTiming]:
+        """Handle one failure. Returns its timing, or None if unrecoverable."""
         detected_at = failure.detected_at
 
         self._say(f"\n  !! FAILURE DETECTED  {failure.describe()}")
@@ -264,26 +271,28 @@ class RecoveryController:
             self.events.emit("resume_failed", attempt=attempt)
             return None
 
-        detail = {
-            "attempt": attempt,
-            "failed_rank": failure.rank,
-            "failure_kind": failure.kind,
-            "exit_code": failure.exit_code,
-            "step_at_failure": failure.last_step,
-            "restored_to_step": restore_step,
-            "steps_lost": (max(0, (failure.last_step or 0) - restore_step)),
-            "recovery_seconds": resumed_at - detected_at,
-            "breakdown": {
-                "terminate_workers": killed_at - detected_at,
-                "select_checkpoint": checkpoint_at - killed_at,
-                "relaunch_workers": relaunched_at - checkpoint_at,
-                "reach_first_step": resumed_at - relaunched_at,
-            },
-        }
-        self.events.emit("training_resumed", **detail)
-        self._say(f"     RECOVERED in {detail['recovery_seconds']:.2f}s "
-                  f"(lost {detail['steps_lost']} step(s) of work)")
-        return detail
+        # A typed value rather than an ad-hoc dict: Phase 5's scheduler
+        # consumes the total as its recovery-cost input R, and Phase 6's
+        # benchmark reports the breakdown per strategy. See
+        # metrics/recovery_timing.py.
+        timing = RecoveryTiming(
+            attempt=attempt,
+            failed_rank=failure.rank,
+            failure_kind=failure.kind,
+            exit_code=failure.exit_code,
+            step_at_failure=failure.last_step,
+            restored_to_step=restore_step,
+            steps_lost=max(0, (failure.last_step or 0) - restore_step),
+            recovery_seconds=resumed_at - detected_at,
+            terminate_workers=killed_at - detected_at,
+            select_checkpoint=checkpoint_at - killed_at,
+            relaunch_workers=relaunched_at - checkpoint_at,
+            reach_first_step=resumed_at - relaunched_at,
+        )
+        self.events.emit("training_resumed", **timing.as_dict())
+        self._say(f"     RECOVERED in {timing.recovery_seconds:.2f}s "
+                  f"(lost {timing.steps_lost} step(s) of work)")
+        return timing
 
     # ------------------------------------------------------------------
     # Main loop
@@ -344,6 +353,7 @@ class RecoveryController:
             self.recoveries.append(detail)
 
         elapsed = time.time() - started
+        stats = summarize(self.recoveries)
         summary = {
             "outcome": outcome,
             "job_dir": self.job_dir,
@@ -352,15 +362,14 @@ class RecoveryController:
             "recoveries": len(self.recoveries),
             "wall_clock_seconds": elapsed,
             "exit_codes": self.manager.exit_codes(),
-            "recovery_details": self.recoveries,
+            "recovery_stats": stats,
+            "recovery_details": [t.as_dict() for t in self.recoveries],
         }
         if self.recoveries:
-            times = [r["recovery_seconds"] for r in self.recoveries]
-            summary["recovery_seconds_mean"] = sum(times) / len(times)
-            summary["recovery_seconds_min"] = min(times)
-            summary["recovery_seconds_max"] = max(times)
-            summary["steps_lost_total"] = sum(r["steps_lost"]
-                                              for r in self.recoveries)
+            summary["recovery_seconds_mean"] = stats["mean_seconds"]
+            summary["recovery_seconds_min"] = stats["min_seconds"]
+            summary["recovery_seconds_max"] = stats["max_seconds"]
+            summary["steps_lost_total"] = stats["steps_lost"]
 
         self.events.emit("job_finished", **{k: v for k, v in summary.items()
                                             if k != "recovery_details"})
@@ -394,6 +403,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--subset-size", type=int, default=1024)
     p.add_argument("--max-steps", type=int, default=40)
     p.add_argument("--checkpoint-every", type=int, default=5)
+    p.add_argument("--adaptive-checkpointing", action="store_true",
+                   help="Let the Phase 5 scheduler choose the interval")
+    p.add_argument("--min-checkpoint-interval", type=int, default=1)
+    p.add_argument("--max-checkpoint-interval", type=int, default=10000)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--deterministic", action="store_true", default=True)
     p.add_argument("--failure-rate", type=float, default=0.05)
@@ -420,6 +433,10 @@ def train_flags_from(args: argparse.Namespace) -> List[str]:
     ]
     if args.deterministic:
         flags.append("--deterministic")
+    if args.adaptive_checkpointing:
+        flags += ["--adaptive-checkpointing",
+                  "--min-checkpoint-interval", str(args.min_checkpoint_interval),
+                  "--max-checkpoint-interval", str(args.max_checkpoint_interval)]
     return flags
 
 
@@ -450,9 +467,8 @@ def print_summary(summary: dict) -> None:
         print(f"  total work lost to failures: "
               f"{summary['steps_lost_total']} step(s)")
 
-        print("\n  where recovery time goes (first recovery):")
-        for phase, seconds in summary["recovery_details"][0]["breakdown"].items():
-            print(f"    {phase:<20} {seconds:>7.2f}s")
+        print("\n  where recovery time goes (mean across recoveries):")
+        print(format_breakdown(summary["recovery_stats"]["mean_breakdown"]))
     print("=" * 78)
 
 
