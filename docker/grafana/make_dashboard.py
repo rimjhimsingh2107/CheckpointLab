@@ -114,10 +114,20 @@ stat("Recoveries", f'max(checkpointlab_recoveries_total{{{J}}})',
 timeseries(
     "Throughput over time",
     [target(f'checkpointlab_throughput_steps_per_second{{{J}}}',
-            "{{ckpt_job}} steps/sec")],
-    0, 4, 12, 8, unit="none", colors={}, minval=0,
-    desc="Collapses to zero across a recovery -- the workers are gone, so no "
-         "steps complete. The width of the trough IS the recovery cost.")
+            "{{ckpt_job}} reported (rolling mean)"),
+     target(f'rate(checkpointlab_steps_completed_total{{{J}}}[30s])',
+            "{{ckpt_job}} observed (rate)", "B")],
+    0, 4, 12, 8, unit="none", minval=0,
+    colors={}, 
+    desc="TWO different things, plotted together on purpose. 'reported' is "
+         "the exporter's gauge: a rolling mean of the last 20 logged step "
+         "durations. It degrades gently across a recovery rather than "
+         "collapsing, because a dead worker stops APPENDING to the log -- it "
+         "does not write zeros -- so the mean just goes stale. 'observed' is "
+         "rate() over the step counter, which does fall to zero while no "
+         "steps are completing, and whose trough width is the recovery cost. "
+         "Read the gauge for 'how fast is a step', the rate for 'is work "
+         "happening at all'.")
 
 timeseries(
     "Checkpoint interval over time",

@@ -190,7 +190,7 @@ services:
     image: grafana/grafana:11.6.0
     profiles: [monitor]
     container_name: ckpt-grafana
-    depends_on: [prometheus]
+    depends_on: [prometheus, renderer]
     ports:
       - "3000:3000"
     environment:
@@ -204,9 +204,32 @@ services:
       GF_USERS_DEFAULT_THEME: "light"
       # Land straight on the dashboard instead of the Grafana welcome page.
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/checkpointlab.json
+      # Server-side rendering, so panel PNGs can be captured reproducibly
+      # rather than screenshotted by hand. The callback URL is how the
+      # renderer reaches back into Grafana, so it must be the in-network
+      # address, not localhost.
+      GF_RENDERING_SERVER_URL: http://renderer:8081/render
+      GF_RENDERING_CALLBACK_URL: http://grafana:3000/
+      GF_LOG_FILTERS: rendering:info
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks: [ckpt]
+
+  # Headless Chromium that renders panels to PNG. Grafana itself cannot do
+  # this -- server-side rendering is a plugin, and the supported form of that
+  # plugin is a separate service Grafana calls out to. Without it,
+  # /render/... returns an error and the only way to capture a dashboard is a
+  # human with a screenshot tool, which is not something a repo can commit.
+  renderer:
+    image: grafana/grafana-image-renderer:3.12.9
+    profiles: [monitor]
+    container_name: ckpt-renderer
+    environment:
+      ENABLE_METRICS: "false"
+      # Chromium in a container with a small /dev/shm will crash on render;
+      # this keeps it off shared memory instead of raising shm_size.
+      RENDERING_ARGS: "--no-sandbox,--disable-dev-shm-usage"
     networks: [ckpt]
 
 networks:

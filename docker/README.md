@@ -247,8 +247,13 @@ rather than embedded as a PNG — see the caveat below.
 - **Stat row** — Active failures `0` (green, with visible red spikes in the
   sparkline where recoveries were in flight), Throughput `0.70`, Last recovery
   `5.82 s`, Checkpoint interval `1`, Recoveries `5`.
-- **Throughput over time** — flat zero until 15:59, then a climb from ~0.35 to
-  0.70 steps/sec with small notches at the recovery points.
+- **Throughput over time** — two series on purpose. `reported` is the
+  exporter's rolling mean of logged step durations; `observed` is
+  `rate(checkpointlab_steps_completed_total[30s])`. They diverge in a way that
+  is worth seeing: the rolling mean degrades gently and then *freezes* at its
+  last value when the job ends, because a dead worker stops appending to the
+  log rather than writing zeros. The rate falls to a real zero. Read the gauge
+  for "how fast is a step", the rate for "is work happening at all".
 - **Checkpoint interval over time** — two series. Interval-in-steps (green,
   stepped) starts at 4, the launch value, then sits at 1. T\* in seconds
   (yellow) swings 2.9 → 1.2 and oscillates around 1.4 as the scheduler
@@ -264,10 +269,18 @@ rather than embedded as a PNG — see the caveat below.
 
 ### Caveats, stated rather than glossed
 
-- **No PNG of the dashboard is committed.** Server-side rendering needs the
-  `grafana-image-renderer` plugin, which is not installed. The dashboard was
-  confirmed by viewing it in a browser and by check 5 above; the description
-  is what it showed, not what it should show.
+- **PNGs are rendered server-side, not screenshotted.** The `monitor` profile
+  includes a `grafana-image-renderer:3.12.9` service, so panels are captured
+  reproducibly with `curl`:
+
+  ```bash
+  curl "localhost:3000/render/d-solo/checkpointlab/?orgId=1&panelId=6\
+&var-job=<job>&from=now-12m&to=now&width=1100&height=420&theme=light&scale=2" \
+    -o docs/grafana-throughput.png
+  ```
+
+  `panelId` 6 = throughput, 7 = checkpoint interval, 8 = recovery phases.
+  Committed examples are in [`docs/`](../docs).
 - **Gauges freeze when a job ends, they do not fall to zero.** The exporter
   reports the last value in the log, and a finished job's log stops changing —
   so throughput reads `0.70` forever after completion rather than dropping.

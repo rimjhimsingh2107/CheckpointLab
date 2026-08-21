@@ -368,7 +368,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Throughput over time",
-      "description": "Collapses to zero across a recovery -- the workers are gone, so no steps complete. The width of the trough IS the recovery cost.",
+      "description": "TWO different things, plotted together on purpose. 'reported' is the exporter's gauge: a rolling mean of the last 20 logged step durations. It degrades gently across a recovery rather than collapsing, because a dead worker stops APPENDING to the log -- it does not write zeros -- so the mean just goes stale. 'observed' is rate() over the step counter, which does fall to zero while no steps are completing, and whose trough width is the recovery cost. Read the gauge for 'how fast is a step', the rate for 'is work happening at all'.",
       "datasource": {
         "type": "prometheus",
         "uid": "checkpointlab-prom"
@@ -381,9 +381,20 @@
           },
           "editorMode": "code",
           "expr": "checkpointlab_throughput_steps_per_second{ckpt_job=~\"$job\"}",
-          "legendFormat": "{{ckpt_job}} steps/sec",
+          "legendFormat": "{{ckpt_job}} reported (rolling mean)",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "checkpointlab-prom"
+          },
+          "editorMode": "code",
+          "expr": "rate(checkpointlab_steps_completed_total{ckpt_job=~\"$job\"}[30s])",
+          "legendFormat": "{{ckpt_job}} observed (rate)",
+          "range": true,
+          "refId": "B"
         }
       ],
       "fieldConfig": {
