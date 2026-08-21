@@ -346,11 +346,53 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         latest = find_latest_checkpoint(args.checkpoint_dir)
         if latest:
             meta = load_checkpoint(latest, model, optimizer, rank,
-                                   map_location=device)
+                                   map_location=device,
+                                   current_world_size=world_size)
             start_epoch = meta["epoch"]
-            resume_skip = meta["step_in_epoch"]
             global_step = meta["global_step"]
             resume_rng = meta["rng_state"]
+
+            saved_world = meta["world_size"]
+            elastic = saved_world != world_size
+
+            if not elastic:
+                resume_skip = meta["step_in_epoch"]
+            else:
+                # ELASTIC RESUME. step_in_epoch counts steps of the OLD world
+                # size and means nothing here: a step is
+                # world_size * batch_size samples, so 6 steps at 2 ranks is
+                # 384 samples but 6 steps at 3 ranks is 576. Convert through
+                # the sample position, which is world-size independent.
+                samples = meta["samples_into_epoch"]
+                if samples is None:
+                    raise SystemExit(
+                        f"cannot resume elastically from {latest}: it has no "
+                        f"samples_into_epoch (written before format v2)")
+                per_step = world_size * args.batch_size
+                resume_skip = samples // per_step
+                leftover = samples % per_step
+
+                # Round DOWN, so at worst a fraction of one step's samples are
+                # seen twice. Rounding up would SKIP unseen samples, and this
+                # project's bias throughout has been to redo work rather than
+                # lose it.
+                if resume_skip > steps_per_epoch:
+                    resume_skip = steps_per_epoch
+
+                if rank == 0:
+                    print(f"[rank {rank}] ELASTIC RESUME: world_size "
+                          f"{saved_world} -> {world_size}")
+                    print(f"[rank {rank}]   {samples} samples into epoch "
+                          f"{start_epoch}; at {world_size}x{args.batch_size} "
+                          f"per step that is step {resume_skip}"
+                          + (f" (+{leftover} samples re-seen)" if leftover
+                             else " (exact)"))
+                    print(f"[rank {rank}]   effective batch "
+                          f"{saved_world * args.batch_size} -> "
+                          f"{world_size * args.batch_size}: the loss "
+                          f"trajectory WILL differ from the original world "
+                          f"size, by construction")
+
             if rank == 0:
                 print(f"[rank {rank}] RESUMED from {latest} "
                       f"(epoch={start_epoch}, step_in_epoch={resume_skip}, "
@@ -505,6 +547,14 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             # batch is augmented exactly as it was in the uninterrupted run.
             if resume_rng is not None:
                 restore_rng_state(resume_rng)
+            else:
+                # No usable saved stream -- either a fresh start, or the world
+                # size changed and load_checkpoint declined to hand this rank
+                # someone else's RNG (which would correlate augmentations
+                # across ranks). Reseed from (seed, rank) so the streams stay
+                # independent and the run stays reproducible for THIS world
+                # size, even though it cannot match the previous one.
+                seed_everything(args.seed, rank)
             if rank == 0:
                 print(f"[rank {rank}] fast-forwarded epoch {epoch} to step "
                       f"{step} ({fast_forward_seconds:.2f}s)")
@@ -609,6 +659,9 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                     model, optimizer, ck_epoch, ck_step, global_step,
                     rank, world_size, checkpoint_dir=args.checkpoint_dir,
                     seed=args.seed, extra={"loss": global_loss},
+                    # Needed to record the epoch position in SAMPLES, which
+                    # is the only form that survives a world-size change.
+                    batch_size=args.batch_size,
                 )
 
                 if rank == 0 and checkpoint_log is not None:

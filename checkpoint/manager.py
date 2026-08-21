@@ -48,7 +48,13 @@ DEFAULT_CHECKPOINT_DIR = os.path.join("results", "checkpoints")
 
 # Bump if the on-disk layout changes incompatibly, so old checkpoints get
 # rejected loudly instead of silently loading garbage into the model.
-FORMAT_VERSION = 1
+#
+# v2 added batch_size and samples_into_epoch, which is what makes elastic
+# resumption possible: step_in_epoch alone is meaningless at a different world
+# size, because one step consumes world_size * batch_size samples. A v1
+# checkpoint cannot be converted -- it does not record the batch size -- so it
+# is rejected rather than guessed at.
+FORMAT_VERSION = 2
 
 _CKPT_GLOB = "ckpt_step*.pt"
 _MANIFEST = "latest.json"
@@ -168,6 +174,7 @@ def save_checkpoint(
     seed: Optional[int] = None,
     extra: Optional[Dict[str, Any]] = None,
     keep_last: int = 5,
+    batch_size: Optional[int] = None,
 ) -> Optional[float]:
     """
     Write a resumable checkpoint. Called by every rank; only rank 0 writes.
@@ -199,6 +206,13 @@ def save_checkpoint(
         "step_in_epoch": step_in_epoch,
         "global_step": global_step,
         "world_size": world_size,
+        "batch_size": batch_size,
+        # Position in the epoch measured in SAMPLES, not steps. This is the
+        # only form that survives a world-size change: a step is
+        # world_size * batch_size samples, so "step 6" means one thing at 2
+        # ranks and something else entirely at 3. Samples are absolute.
+        "samples_into_epoch": (step_in_epoch * world_size * batch_size
+                               if batch_size else None),
         "seed": seed,
         "rng_states": rng_states,
         "saved_at": time.time(),
@@ -231,6 +245,7 @@ def load_checkpoint(
     rank: int,
     map_location: Any = "cpu",
     restore_rng: bool = True,
+    current_world_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Restore a checkpoint into `model`/`optimizer` and return its metadata.
@@ -248,6 +263,8 @@ def load_checkpoint(
             f"expected {FORMAT_VERSION}. Refusing to load."
         )
 
+    saved_world_size = payload["world_size"]
+
     target = model.module if isinstance(model, DDP) else model
     target.load_state_dict(payload["model"])
 
@@ -255,13 +272,20 @@ def load_checkpoint(
         optimizer.load_state_dict(payload["optimizer"])
 
     rng_states = payload.get("rng_states") or []
-    if rank < len(rng_states):
+
+    # Under a world-size change there is no honest mapping from the saved RNG
+    # streams to the new ranks. Handing rank 3 a copy of rank 0's stream --
+    # the obvious fallback -- is actively harmful: the two ranks would then
+    # draw IDENTICAL augmentations, correlating the noise across what is
+    # supposed to be an independently-sampled batch. Returning None instead
+    # tells the caller to reseed deterministically from (seed, rank), which
+    # keeps the streams independent. Bit-exactness is already unavailable at a
+    # new world size (the effective batch size has changed), so there is
+    # nothing left to preserve by faking continuity.
+    if current_world_size is not None and current_world_size != saved_world_size:
+        my_rng = None
+    elif rank < len(rng_states):
         my_rng = rng_states[rank]
-    elif rng_states:
-        # Resumed at a larger world size than we saved at (Phase 7 elastic
-        # resumption). Exact reproducibility is impossible here, so fall
-        # back to rank 0's stream rather than leaving this rank unseeded.
-        my_rng = rng_states[0]
     else:
         my_rng = None
 
@@ -272,7 +296,9 @@ def load_checkpoint(
         "epoch": payload["epoch"],
         "step_in_epoch": payload["step_in_epoch"],
         "global_step": payload["global_step"],
-        "world_size": payload["world_size"],
+        "world_size": saved_world_size,
+        "batch_size": payload.get("batch_size"),
+        "samples_into_epoch": payload.get("samples_into_epoch"),
         "seed": payload.get("seed"),
         "extra": payload.get("extra", {}),
         "path": path,

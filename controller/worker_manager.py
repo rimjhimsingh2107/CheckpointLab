@@ -160,8 +160,21 @@ class WorkerManager:
 
     # ---------------- lifecycle ----------------
 
-    def launch(self, resume: bool) -> None:
-        """Start a fresh generation of `world_size` worker processes."""
+    def launch(self, resume: bool, world_size: Optional[int] = None) -> None:
+        """
+        Start a fresh generation of worker processes.
+
+        `world_size` overrides the manager's current world size, which is what
+        makes elastic resumption possible. Nothing about the process group
+        needs resizing: each generation calls dist.init_process_group from
+        scratch in brand-new processes, so a different world size is just
+        different argv. That falls out of the Phase 4 decision to supervise
+        ranks as separate OS processes rather than mp.spawn children -- the
+        expensive part of elasticity was paid for already, without knowing it.
+        """
+        if world_size is not None and world_size != self.world_size:
+            print(f"     world size {self.world_size} -> {world_size}")
+            self.world_size = world_size
         self.generation += 1
         # Heartbeats from the previous generation would otherwise be read as
         # this generation's, making a just-launched worker look stale.

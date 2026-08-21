@@ -33,3 +33,5 @@ results/docker-recover/
 results/baremetal-train/
 # Monitoring demo jobs -- ~427 MB each (checkpoints).
 results/monitor-*/
+# Elastic resumption run dirs (verify_elastic.py + ad-hoc demos).
+results/elastic*/

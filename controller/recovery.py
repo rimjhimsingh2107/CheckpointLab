@@ -150,9 +150,15 @@ class RecoveryController:
 
     def __init__(self, job_dir: str, world_size: int, train_flags: List[str],
                  max_restarts: int = 5, poll_interval: float = 0.2,
-                 heartbeat_timeout: float = 90.0, quiet: bool = False):
+                 heartbeat_timeout: float = 90.0, quiet: bool = False,
+                 world_size_plan: Optional[List[int]] = None):
         self.job_dir = job_dir
         self.world_size = world_size
+        # Generation i (1-based) runs at plan[i-1], with the last entry
+        # repeating. `[2, 3]` means: start at 2 workers, and every restart
+        # after the first failure runs at 3. Sized by generation rather than
+        # by attempt so the initial launch is covered by the same rule.
+        self.world_size_plan = world_size_plan or [world_size]
         self.max_restarts = max_restarts
         self.poll_interval = poll_interval
         self.quiet = quiet
@@ -167,6 +173,10 @@ class RecoveryController:
             heartbeat_timeout=heartbeat_timeout)
 
         self.recoveries: List[RecoveryTiming] = []
+
+    def _world_size_for(self, generation: int) -> int:
+        plan = self.world_size_plan
+        return plan[min(generation, len(plan)) - 1]
 
     def _say(self, message: str) -> None:
         if not self.quiet:
@@ -258,12 +268,15 @@ class RecoveryController:
             self.events.emit("checkpoint_selected", **meta,
                              rejected=len(rejected))
 
-        # 3. Relaunch and wait for evidence of real progress.
-        self.manager.launch(resume=True)
+        # 3. Relaunch and wait for evidence of real progress, possibly at a
+        #    different world size.
+        next_ws = self._world_size_for(self.manager.generation + 1)
+        self.manager.launch(resume=True, world_size=next_ws)
         relaunched_at = time.time()
         self.events.emit("generation_launched",
                          generation=self.manager.generation, resume=True,
-                         restore_step=restore_step)
+                         restore_step=restore_step,
+                         world_size=self.manager.world_size)
         self._say(f"     relaunched as generation {self.manager.generation}")
 
         resumed_at = self._wait_for_training_to_resume(restore_step)
@@ -305,10 +318,14 @@ class RecoveryController:
                          max_restarts=self.max_restarts)
 
         self._say(f"controller: job_dir={self.job_dir}")
-        self._say(f"controller: launching {self.world_size} workers "
-                  f"(generation 1)")
-        self.manager.launch(resume=True)
-        self.events.emit("generation_launched", generation=1, resume=True)
+        first_ws = self._world_size_for(1)
+        self._say(f"controller: launching {first_ws} workers (generation 1)")
+        if len(set(self.world_size_plan)) > 1:
+            self._say(f"controller: elastic plan {self.world_size_plan} "
+                      f"(generation -> world size, last entry repeats)")
+        self.manager.launch(resume=True, world_size=first_ws)
+        self.events.emit("generation_launched", generation=1, resume=True,
+                         world_size=first_ws)
 
         attempt = 0
         outcome = "completed"
@@ -357,7 +374,8 @@ class RecoveryController:
         summary = {
             "outcome": outcome,
             "job_dir": self.job_dir,
-            "world_size": self.world_size,
+            "world_size": self.manager.world_size,
+            "world_size_plan": self.world_size_plan,
             "generations": self.manager.generation,
             "recoveries": len(self.recoveries),
             "wall_clock_seconds": elapsed,
@@ -390,6 +408,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--job-dir", default=None,
                    help="Defaults to a fresh results/jobs/<stamp>-<id> dir")
     p.add_argument("--world-size", type=int, default=2)
+    p.add_argument("--world-size-plan", default=None,
+                   help="Comma-separated world size per generation, last "
+                        "entry repeating. '2,3' starts at 2 workers and "
+                        "restarts at 3 -- elastic resumption. Overrides "
+                        "--world-size.")
     p.add_argument("--max-restarts", type=int, default=5)
     p.add_argument("--poll-interval", type=float, default=0.2)
     p.add_argument("--heartbeat-timeout", type=float, default=90.0,
@@ -476,11 +499,15 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     job_dir = args.job_dir or new_job_dir()
 
+    plan = ([int(x) for x in args.world_size_plan.split(",")]
+            if args.world_size_plan else None)
+
     controller = RecoveryController(
-        job_dir=job_dir, world_size=args.world_size,
+        job_dir=job_dir, world_size=(plan[0] if plan else args.world_size),
         train_flags=train_flags_from(args),
         max_restarts=args.max_restarts, poll_interval=args.poll_interval,
-        heartbeat_timeout=args.heartbeat_timeout, quiet=args.quiet)
+        heartbeat_timeout=args.heartbeat_timeout, quiet=args.quiet,
+        world_size_plan=plan)
 
     summary = controller.run()
     print_summary(summary)
