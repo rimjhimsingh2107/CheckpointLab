@@ -95,6 +95,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-checkpoint-interval", type=int, default=10000)
     p.add_argument("--scheduler-log", default=None,
                    help="JSONL log of every interval decision and its inputs")
+    p.add_argument("--checkpoint-log", default=None,
+                   help="JSONL log of every checkpoint write and every resume "
+                        "fast-forward, with durations. Written for fixed and "
+                        "adaptive alike so Phase 6 can measure both.")
     p.add_argument("--checkpoint-dir", default=DEFAULT_CHECKPOINT_DIR)
     p.add_argument("--no-resume", action="store_true",
                    help="Start from scratch even if a checkpoint exists")
@@ -201,6 +205,8 @@ def apply_job_dir(args: argparse.Namespace) -> argparse.Namespace:
         args.loss_log = os.path.join(args.job_dir, "loss_log.jsonl")
     if args.scheduler_log is None:
         args.scheduler_log = os.path.join(args.job_dir, "scheduler_log.jsonl")
+    if args.checkpoint_log is None:
+        args.checkpoint_log = os.path.join(args.job_dir, "checkpoint_log.jsonl")
 
     return args
 
@@ -371,8 +377,9 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         )
         if rank == 0:
             print(f"[rank {rank}] adaptive checkpointing ON "
-                  f"(initial interval {args.checkpoint_every} steps, "
-                  f"{scheduler.failures_observed} prior failure(s) in log, "
+                  f"({scheduler.failures_observed} prior failure(s) in log, "
+                  f"d={scheduler.checkpoint_cost():.2f}s, "
+                  f"{scheduler.throughput():.2f} steps/s, "
                   f"R={scheduler.recovery_cost():.2f}s)")
 
     checkpoint_interval = args.checkpoint_every
@@ -396,12 +403,38 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         dist.broadcast(buf, src=0)
         return int(buf.item())
 
-    if scheduler is not None:
-        next_checkpoint_step = agree_on_next_checkpoint(next_checkpoint_step)
-
     scheduler_log = (LossLog(args.scheduler_log, args.launch_id)
                      if (scheduler is not None and args.scheduler_log
                          and rank == 0) else None)
+
+    if scheduler is not None:
+        # Decide the FIRST interval of this generation from what the job's
+        # logs already know, rather than falling back to --checkpoint-every.
+        # Without this a restarted generation checkpoints at the launch
+        # default until it has written twice, which under a high failure rate
+        # is most of its life.
+        opening = None
+        if rank == 0:
+            opening = scheduler.decide(time.time(), global_step)
+            proposed = global_step + opening.interval_steps
+        else:
+            proposed = global_step + checkpoint_interval
+
+        next_checkpoint_step = agree_on_next_checkpoint(proposed)
+        checkpoint_interval = next_checkpoint_step - global_step
+
+        if rank == 0 and opening is not None:
+            print(f"[rank {rank}] opening interval {checkpoint_interval} steps "
+                  f"(T*={opening.optimal_seconds:.2f}s, M={opening.mtbf:.1f}s, "
+                  f"{opening.reason})")
+            if scheduler_log is not None:
+                scheduler_log.write(**opening.as_dict())
+
+    # Unconditional, unlike scheduler_log: the benchmark has to measure
+    # checkpoint overhead for the FIXED strategies too, and they have no
+    # scheduler to log decisions.
+    checkpoint_log = (LossLog(args.checkpoint_log, args.launch_id)
+                      if (args.checkpoint_log and rank == 0) else None)
 
     # ---------------- failure injection ----------------
     # The schedule needs a step budget up front. Because each step's outcome
@@ -462,8 +495,10 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         step = 0
 
         if epoch == start_epoch and resume_skip:
+            fast_forward_started = time.perf_counter()
             for _ in range(resume_skip):
                 next(batches)
+            fast_forward_seconds = time.perf_counter() - fast_forward_started
             step = resume_skip
             # Replaying those batches ran the augmentation transforms, which
             # advanced the RNG. Re-apply the checkpointed state so the NEXT
@@ -471,7 +506,17 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             if resume_rng is not None:
                 restore_rng_state(resume_rng)
             if rank == 0:
-                print(f"[rank {rank}] fast-forwarded epoch {epoch} to step {step}")
+                print(f"[rank {rank}] fast-forwarded epoch {epoch} to step "
+                      f"{step} ({fast_forward_seconds:.2f}s)")
+                # Replayed batches are decoded and augmented only to be
+                # discarded. It is real wall-clock cost caused by the
+                # checkpoint interval, so the benchmark must not miss it:
+                # a long interval leaves more to fast-forward.
+                if checkpoint_log is not None:
+                    checkpoint_log.write(event="fast_forward", epoch=epoch,
+                                         global_step=global_step,
+                                         steps_skipped=resume_skip,
+                                         duration_seconds=fast_forward_seconds)
 
         for images, labels in batches:
             step_started = time.perf_counter()
@@ -486,13 +531,14 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             step += 1
             global_step += 1
 
+            # Measured after the optimizer step and before checkpointing, so
+            # it reflects training work only. Folding the checkpoint write in
+            # would make checkpoints look like they slow down training, and
+            # the scheduler would then lengthen the interval to avoid a cost
+            # it had double-counted.
+            step_seconds = time.perf_counter() - step_started
             if scheduler is not None:
-                # Measured after the optimizer step and before checkpointing,
-                # so throughput reflects training work only. Folding the
-                # checkpoint write into it would make checkpoints look like
-                # they slow down training, and the scheduler would then
-                # lengthen the interval to avoid a cost it had double-counted.
-                scheduler.record_step(time.perf_counter() - step_started)
+                scheduler.record_step(step_seconds)
 
             local_loss = loss.detach()
             # Mean loss across ranks. Rank 0's local loss alone would only
@@ -510,9 +556,13 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             counted += 1
 
             if loss_log is not None:
+                # step_seconds makes wasted compute directly measurable: a
+                # global_step appearing more than once across launches was
+                # recomputed, and its duration is the cost of that.
                 loss_log.write(global_step=global_step, epoch=epoch,
                                step_in_epoch=step, loss=global_loss,
-                               rank0_loss=local_loss.item())
+                               rank0_loss=local_loss.item(),
+                               step_seconds=step_seconds)
 
             if args.heartbeat_every and global_step % args.heartbeat_every == 0:
                 beat(global_step, epoch)
@@ -561,6 +611,13 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                     seed=args.seed, extra={"loss": global_loss},
                 )
 
+                if rank == 0 and checkpoint_log is not None:
+                    checkpoint_log.write(event="checkpoint", epoch=epoch,
+                                         global_step=global_step,
+                                         duration_seconds=dur,
+                                         interval_used=checkpoint_interval,
+                                         adaptive=scheduler is not None)
+
                 if scheduler is None:
                     next_checkpoint_step = global_step + checkpoint_interval
                     if rank == 0:
@@ -607,6 +664,8 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     if scheduler_log is not None:
         scheduler_log.close()
+    if checkpoint_log is not None:
+        checkpoint_log.close()
     if loss_log is not None:
         loss_log.close()
     cleanup()

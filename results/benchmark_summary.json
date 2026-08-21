@@ -1,0 +1,44 @@
+{
+  "scenarios": [
+    {
+      "scenario": "light_0.05",
+      "failure_rate": 0.05,
+      "best_fixed_strategy": "fixed_short",
+      "best_fixed_wasted_seconds": 28.53,
+      "adaptive_wasted_seconds": 30.54,
+      "waste_reduction_pct": -7.05,
+      "adaptive_beats_best_fixed": false,
+      "best_fixed_wall_seconds": 91.46,
+      "adaptive_wall_seconds": 97.58,
+      "adaptive_mean_interval": 3.33
+    },
+    {
+      "scenario": "medium_0.10",
+      "failure_rate": 0.1,
+      "best_fixed_strategy": "fixed_short",
+      "best_fixed_wasted_seconds": 43.04,
+      "adaptive_wasted_seconds": 37.74,
+      "waste_reduction_pct": 12.33,
+      "adaptive_beats_best_fixed": true,
+      "best_fixed_wall_seconds": 106.78,
+      "adaptive_wall_seconds": 101.88,
+      "adaptive_mean_interval": 3.0
+    },
+    {
+      "scenario": "severe_0.20",
+      "failure_rate": 0.2,
+      "best_fixed_strategy": "fixed_short",
+      "best_fixed_wasted_seconds": 83.93,
+      "adaptive_wasted_seconds": 92.19,
+      "waste_reduction_pct": -9.84,
+      "adaptive_beats_best_fixed": false,
+      "best_fixed_wall_seconds": 140.24,
+      "adaptive_wall_seconds": 148.54,
+      "adaptive_mean_interval": 2.22
+    }
+  ],
+  "wins": 1,
+  "total": 3,
+  "warnings": [],
+  "steps": 60
+}

@@ -518,3 +518,66 @@ def test_scenario_comparison_rejects_configs_differing_beyond_failure_rate():
     with pytest.raises(SchedulerCheckError, match="more than the failure config"):
         assert_only_failure_config_differs({"worker_flags": base},
                                            {"worker_flags": rigged})
+
+
+def test_scheduler_from_job_inherits_checkpoint_cost_and_throughput(tmp_path):
+    """
+    d and throughput are per-PROCESS measurements, and the process that made
+    them is the one that died. If they aren't rebuilt from the job's logs,
+    decide() has no choice but to return the launch-time default, so every
+    restarted generation checkpoints at that default until it has written
+    twice — and under a high failure rate generations are too short for the
+    learned interval to ever apply. That silently turns "adaptive" into
+    "fixed default", which is exactly what the Phase 6 benchmark caught.
+    """
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "checkpoint_log.jsonl").write_text("\n".join(
+        json.dumps({"event": "checkpoint", "duration_seconds": 0.4,
+                    "global_step": s}) for s in (2, 4, 6)) + "\n")
+    (job / "loss_log.jsonl").write_text("\n".join(
+        json.dumps({"global_step": s, "step_seconds": 1.0})
+        for s in range(1, 7)) + "\n")
+    (job / "failure_log.jsonl").write_text(
+        json.dumps({"event": "injected_failure", "timestamp": 100.0}) + "\n"
+        + json.dumps({"event": "injected_failure", "timestamp": 106.0}) + "\n")
+
+    s = scheduler_from_job(str(job), initial_interval_steps=8)
+
+    assert s.checkpoint_cost() == pytest.approx(0.4)
+    assert s.throughput() == pytest.approx(1.0)
+    # With d and throughput known, the opening decision is computed, not the
+    # launch default.
+    decision = s.decide(112.0)
+    assert "sqrt" in decision.reason
+    assert decision.interval_steps != 8
+
+
+def test_scheduler_from_job_without_measurement_logs_falls_back(tmp_path):
+    """No logs yet (a genuinely fresh job) must still work."""
+    job = tmp_path / "job"
+    job.mkdir()
+    s = scheduler_from_job(str(job), initial_interval_steps=8)
+    assert s.decide(10.0).interval_steps == 8
+
+
+def test_measurement_log_readers_are_windowed_and_truncation_safe(tmp_path):
+    from checkpoint.scheduler import (
+        checkpoint_costs_from_log,
+        step_durations_from_log,
+    )
+
+    ck = tmp_path / "checkpoint_log.jsonl"
+    ck.write_text("\n".join(
+        json.dumps({"event": "checkpoint", "duration_seconds": float(i)})
+        for i in range(1, 11))
+        + "\n" + json.dumps({"event": "fast_forward", "duration_seconds": 99.0})
+        + "\n" + '{"event": "checkpoint", "duration_sec')
+    costs = checkpoint_costs_from_log(str(ck), limit=3)
+    assert costs == [8.0, 9.0, 10.0], "fast_forward must not count as a write"
+
+    ll = tmp_path / "loss_log.jsonl"
+    ll.write_text("\n".join(
+        json.dumps({"global_step": i, "step_seconds": float(i)})
+        for i in range(1, 11)) + "\n")
+    assert step_durations_from_log(str(ll), limit=2) == [9.0, 10.0]

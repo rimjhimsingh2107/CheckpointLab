@@ -21,3 +21,4 @@ results/repro/
 results/failure_log.jsonl
 results/jobs/
 results/scheduler/
+results/benchmark/

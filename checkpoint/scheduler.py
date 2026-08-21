@@ -375,6 +375,40 @@ def failure_times_from_log(failure_log: str) -> List[float]:
     return sorted(times)
 
 
+def _tail_jsonl(path: str, limit: int) -> List[dict]:
+    """Last `limit` parseable records of a JSONL file."""
+    import json
+    import os
+
+    if not os.path.exists(path):
+        return []
+    records = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue      # truncated final line from the worker that died
+    return records[-limit:] if limit else records
+
+
+def checkpoint_costs_from_log(checkpoint_log: str, limit: int) -> List[float]:
+    """Recent checkpoint write durations recorded for a job."""
+    return [float(r["duration_seconds"])
+            for r in _tail_jsonl(checkpoint_log, 0)
+            if r.get("event") == "checkpoint" and r.get("duration_seconds")][-limit:]
+
+
+def step_durations_from_log(loss_log: str, limit: int) -> List[float]:
+    """Recent per-step durations recorded for a job."""
+    return [float(r["step_seconds"])
+            for r in _tail_jsonl(loss_log, 0)
+            if r.get("step_seconds")][-limit:]
+
+
 def scheduler_from_job(job_dir: str, initial_interval_steps: int,
                        started_at: Optional[float] = None,
                        **kwargs) -> CheckpointScheduler:
@@ -396,6 +430,22 @@ def scheduler_from_job(job_dir: str, initial_interval_steps: int,
     failures = failure_times_from_log(
         os.path.join(job_dir, "failure_log.jsonl"))
     scheduler.observe_failures(failures)
+
+    # Checkpoint cost and throughput are per-PROCESS measurements, and the
+    # process that made them is the one that died. Rebuilding them from the
+    # job's logs is not an optimisation, it is what makes the interval
+    # survive a restart at all: with no d and no throughput, decide() has to
+    # fall back to the interval the job was launched with, so every new
+    # generation would start over at the CLI default and only reach its
+    # learned interval after checkpointing twice. Under a high failure rate
+    # generations are short, so the learned interval would almost never get
+    # used and "adaptive" would quietly degenerate into "fixed default".
+    for duration in checkpoint_costs_from_log(
+            os.path.join(job_dir, "checkpoint_log.jsonl"), scheduler.window):
+        scheduler.record_checkpoint(duration)
+    for duration in step_durations_from_log(
+            os.path.join(job_dir, "loss_log.jsonl"), scheduler.window):
+        scheduler.record_step(duration)
 
     # The very first failure of a job has no preceding gap, so without an
     # anchor a one-failure job would have no completed interval at all.
