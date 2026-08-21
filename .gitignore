@@ -22,3 +22,7 @@ results/failure_log.jsonl
 results/jobs/
 results/scheduler/
 results/benchmark/
+
+# Demo recording: the .cast is regenerable, the GIF is the artefact.
+demo/*.cast
+results/demo/

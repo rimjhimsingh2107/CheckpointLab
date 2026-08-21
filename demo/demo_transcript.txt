@@ -1,0 +1,53 @@
+────────────────────────────────────────────────────────────────────
+ CheckpointLab — crash → detect → recover → resume, unattended
+────────────────────────────────────────────────────────────────────
+
+ The failure schedule is decided up front from the seed:
+
+   failure_rate=0.05 workers=2 seed=23 steps=1..14 -> 1 failures, fingerprint=7ccc940f018f20c1
+   observed rate over the window: 0.0714 (requested 0.05)
+   
+       step  worker killed
+          7              1
+
+ Checkpoints every 3 steps → 3, 6.  Failure at step 7.
+ So the job must lose step 7, restore step 6, replay, and finish at 14.
+
+────────────────────────────────────────────────────────────────────
+ Handing the job to the controller. No further human input.
+────────────────────────────────────────────────────────────────────
+
+controller: job_dir=results/demo
+controller: launching 2 workers (generation 1)
+
+  !! FAILURE DETECTED  worker 1 exited 137 (last reported step 7)
+     worker 1 log | [rank 1] worker mode: world_size=2, port=49506, generation=1
+     worker 1 log | [rank 1] INJECTED FAILURE (worker 1) at global_step=7
+     terminating generation 1 (survivors still up: [0])
+     resuming from ckpt_step00000006.pt (global_step=6, epoch=0, step_in_epoch=6)
+     relaunched as generation 2
+     RECOVERED in 3.99s (lost 1 step(s) of work)
+
+==============================================================================
+PASS — job completed after 1 automatic recovery(ies)
+  job dir            results/demo
+  generations run    2
+  wall clock         22.2s
+  final exit codes   {0: 0, 1: 0}
+
+   #  rank              kind   died@  restored@  lost  recovery s
+   1     1              exit       7          6     1        3.99
+
+  recovery time: mean 3.99s  min 3.99s  max 3.99s
+  total work lost to failures: 1 step(s)
+
+  where recovery time goes (mean across recoveries):
+    terminate_workers       0.06s ( 1.4%)
+    select_checkpoint       0.02s ( 0.6%)
+    relaunch_workers        0.01s ( 0.3%)
+    reach_first_step        3.90s (97.7%)
+==============================================================================
+
+────────────────────────────────────────────────────────────────────
+ Job completed through a worker failure with zero manual intervention.
+────────────────────────────────────────────────────────────────────
