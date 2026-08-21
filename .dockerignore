@@ -1,0 +1,31 @@
+# The build context is the repo root (docker/docker-compose.yml sets
+# `context: ..`), and without this Docker tars ~9 GB and ships it to the
+# daemon before it starts building: 7.8 GB of benchmark job directories,
+# a 782 MB host virtualenv, and the 340 MB dataset.
+#
+# data/ and results/ are deliberately excluded even though the containers
+# need them: they are bind-mounted at runtime. Baking them into the image
+# would make it enormous AND stale.
+
+.venv/
+venv/
+results/
+data/
+
+.git/
+.github/
+
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Checkpoints are ~90 MB each; never in an image.
+*.pt
+*.ckpt
+
+.DS_Store
+.idea/
+.vscode/
+*.log

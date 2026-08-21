@@ -26,3 +26,8 @@ results/benchmark/
 # Demo recording: the .cast is regenerable, the GIF is the artefact.
 demo/*.cast
 results/demo/
+
+# Phase 7 Docker verification run dirs (docker/verify_docker.sh output).
+results/docker-train*/
+results/docker-recover/
+results/baremetal-train/

@@ -1,0 +1,141 @@
+# CheckpointLab compose stack.
+#
+# Three profiles, because "run it in Docker" means different things for the
+# three things this project does:
+#
+#   --profile train    two containers, one per DDP rank, doing real
+#                      distributed training across a container network.
+#                      This is the Phase 1 baseline, containerized.
+#
+#   --profile recover  one container running the Phase 4 controller, which
+#                      supervises its worker ranks as processes INSIDE that
+#                      container. See the note on supervision below -- this
+#                      is deliberately not the same shape as `train`.
+#
+#   --profile test     the test suite, inside the image.
+#
+# WHY `recover` IS ONE CONTAINER AND `train` IS TWO
+#
+# controller/worker_manager.py supervises ranks with subprocess.Popen and
+# os.killpg: it polls process liveness and signals process groups. Those are
+# operations on local PIDs, so a controller in container A cannot see, poll or
+# kill a rank in container B. Making cross-container supervision work needs
+# worker_manager to grow a container backend (talk to the Docker socket,
+# `create`/`start`/`kill`/`wait` instead of Popen/killpg) plus a health model
+# that doesn't assume shared PID namespace. That is a real feature, not a
+# compose-file detail, so it is not claimed here.
+#
+# What `recover` therefore verifies is narrower but still worth having: that
+# the whole crash-detect-restore-resume loop works correctly inside a
+# container -- same gloo rendezvous, same filesystem semantics for atomic
+# checkpoint writes, same signal handling.
+
+name: checkpointlab
+
+x-worker: &worker
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: checkpointlab:local
+  volumes:
+    # Bind-mounted rather than named volumes so checkpoints, loss logs and
+    # recovery logs are inspectable from the host after a run -- the JSONL is
+    # the evidence every earlier phase relies on.
+    - ../results:/app/results
+    # Read-only: CIFAR-10 is an input. Mounting it rw invites a container to
+    # re-download over a good copy.
+    - ../data:/app/data:ro
+  environment:
+    # rank 0 hosts the gloo TCPStore, so every rank rendezvouses on its
+    # service name. On bare metal this defaults to localhost; across
+    # containers it has to be resolvable DNS, which compose provides.
+    MASTER_ADDR: worker0
+    PYTHONUNBUFFERED: "1"
+  networks: [ckpt]
+
+services:
+
+  # ---------------------------------------------------------------- train
+  worker0:
+    <<: *worker
+    profiles: [train]
+    container_name: ckpt-worker0
+    command:
+      - python
+      - training/train.py
+      - --rank=0
+      - --world-size=2
+      - --master-port=29500
+      # TRAIN_RUN lets verify_docker.sh run this profile twice to separate
+      # dirs, which is how in-container determinism gets proven.
+      - --job-dir=/app/results/${TRAIN_RUN:-docker-train}
+      - --deterministic
+      - --batch-size=32
+      - --subset-size=1024
+      - --epochs=2
+      - --max-steps=12
+      - --checkpoint-every=4
+      - --log-every=1
+      - --no-resume
+
+  worker1:
+    <<: *worker
+    profiles: [train]
+    container_name: ckpt-worker1
+    # Ordering only, not readiness -- rank 1 retries the rendezvous, so a
+    # slow rank 0 is survivable. depends_on just avoids the noisy first
+    # connection refusal in the logs.
+    depends_on: [worker0]
+    command:
+      - python
+      - training/train.py
+      - --rank=1
+      - --world-size=2
+      - --master-port=29500
+      # TRAIN_RUN lets verify_docker.sh run this profile twice to separate
+      # dirs, which is how in-container determinism gets proven.
+      - --job-dir=/app/results/${TRAIN_RUN:-docker-train}
+      - --deterministic
+      - --batch-size=32
+      - --subset-size=1024
+      - --epochs=2
+      - --max-steps=12
+      - --checkpoint-every=4
+      - --log-every=1
+      - --no-resume
+
+  # -------------------------------------------------------------- recover
+  controller:
+    <<: *worker
+    profiles: [recover]
+    container_name: ckpt-controller
+    environment:
+      MASTER_ADDR: localhost   # ranks are siblings in this container
+      PYTHONUNBUFFERED: "1"
+    command:
+      - python
+      - controller/recovery.py
+      - --job-dir=/app/results/docker-recover
+      - --world-size=2
+      - --epochs=4
+      - --batch-size=32
+      - --subset-size=1024
+      - --max-steps=14
+      - --checkpoint-every=3
+      - --failure-rate=0.05
+      - --failure-seed=23      # same seed as demo/demo.sh: one failure, step 7, worker 1
+      - --log-every=1000
+
+  # ----------------------------------------------------------------- test
+  tests:
+    <<: *worker
+    profiles: [test]
+    container_name: ckpt-tests
+    environment:
+      MASTER_ADDR: localhost
+      PYTHONUNBUFFERED: "1"
+    command: ["pytest", "-m", "not slow", "-q"]
+
+networks:
+  ckpt:
+    driver: bridge
