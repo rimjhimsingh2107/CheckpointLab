@@ -35,3 +35,4 @@ results/baremetal-train/
 results/monitor-*/
 # Elastic resumption run dirs (verify_elastic.py + ad-hoc demos).
 results/elastic*/
+results/bench_async/

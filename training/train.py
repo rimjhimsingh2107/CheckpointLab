@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from distributed import setup, cleanup, get_device
 from model import build_model
+from checkpoint.async_writer import AsyncCheckpointWriter
 from checkpoint.scheduler import scheduler_from_job
 from checkpoint.manager import (
     DEFAULT_CHECKPOINT_DIR,
@@ -85,6 +86,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "With --adaptive-checkpointing this is only the "
                         "starting interval, used until enough has been "
                         "measured to compute one.")
+    p.add_argument("--async-checkpointing", action="store_true",
+                   help="Serialize checkpoints on a background thread. State "
+                        "is cloned before hand-off, so training only blocks "
+                        "for the copy, not the write. Trade-off: a checkpoint "
+                        "still in flight when the process dies is lost "
+                        "(cleanly -- atomic rename means recovery never sees "
+                        "a partial file).")
     p.add_argument("--adaptive-checkpointing", action="store_true",
                    help="Recompute the interval from measured checkpoint "
                         "cost, failure rate and throughput instead "
@@ -424,6 +432,13 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                   f"{scheduler.throughput():.2f} steps/s, "
                   f"R={scheduler.recovery_cost():.2f}s)")
 
+    # Only rank 0 writes, so only rank 0 needs a writer.
+    ckpt_writer = (AsyncCheckpointWriter()
+                   if (args.async_checkpointing and rank == 0) else None)
+    if ckpt_writer is not None:
+        print(f"[rank {rank}] async checkpointing ON "
+              f"(state cloned on the training thread, serialized off it)")
+
     checkpoint_interval = args.checkpoint_every
     next_checkpoint_step = global_step + checkpoint_interval if checkpoint_interval else 0
 
@@ -662,14 +677,26 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                     # Needed to record the epoch position in SAMPLES, which
                     # is the only form that survives a world-size change.
                     batch_size=args.batch_size,
+                    writer=ckpt_writer,
                 )
 
                 if rank == 0 and checkpoint_log is not None:
-                    checkpoint_log.write(event="checkpoint", epoch=epoch,
-                                         global_step=global_step,
-                                         duration_seconds=dur,
-                                         interval_used=checkpoint_interval,
-                                         adaptive=scheduler is not None)
+                    # duration_seconds is always the time TRAINING BLOCKED, so
+                    # the Phase 6 "checkpoint overhead" metric keeps meaning
+                    # the same thing in both modes. background_seconds is the
+                    # off-thread serialize, reported separately because it is
+                    # real work but not charged to training.
+                    st = ckpt_writer.stats() if ckpt_writer else None
+                    checkpoint_log.write(
+                        event="checkpoint", epoch=epoch,
+                        global_step=global_step,
+                        duration_seconds=dur,
+                        interval_used=checkpoint_interval,
+                        adaptive=scheduler is not None,
+                        mode="async" if ckpt_writer else "sync",
+                        background_seconds=(st["mean_background_seconds"]
+                                            if st else 0.0),
+                        writer_stalls=(st["stalls"] if st else 0))
 
                 if scheduler is None:
                     next_checkpoint_step = global_step + checkpoint_interval
@@ -712,6 +739,22 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             if rank == 0:
                 print(f"[rank {rank}] hit --max-steps={args.max_steps}, stopping")
             break
+
+    if ckpt_writer is not None:
+        # Orderly shutdown only. A simulated crash deliberately does NOT
+        # flush -- a real preemption does not get to, and flushing there
+        # would make async look more durable than it is.
+        waited = ckpt_writer.flush()
+        st = ckpt_writer.stats()
+        print(f"[rank {rank}] async writer: {st['writes_completed']} writes, "
+              f"blocked {st['total_blocked_seconds']:.3f}s total "
+              f"(mean {st['mean_blocked_seconds'] * 1000:.0f} ms), "
+              f"background {st['total_background_seconds']:.3f}s "
+              f"(mean {st['mean_background_seconds'] * 1000:.0f} ms), "
+              f"{st['stalls']} stall(s), flush wait {waited:.3f}s")
+        if st["errors"]:
+            print(f"[rank {rank}] async writer errors: {st['errors']}")
+        ckpt_writer.close()
 
     beat(global_step, args.epochs - 1, state="finished")
 

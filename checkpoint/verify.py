@@ -82,6 +82,8 @@ def _train_cmd(args: argparse.Namespace, *, checkpoint_dir: str, loss_log: str,
         "--launch-id", launch_id,
         "--log-every", "1000",   # keep the transcript readable; JSONL has it all
     ]
+    if args.async_checkpointing:
+        cmd.append("--async-checkpointing")
     if no_resume:
         cmd.append("--no-resume")
     if crash_at_step:
@@ -273,6 +275,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     for key, val in DEFAULTS.items():
         p.add_argument(f"--{key.replace('_', '-')}", type=type(val), default=val)
+    p.add_argument("--async-checkpointing", action="store_true",
+                   help="Run the same correctness experiment with checkpoints "
+                        "written on a background thread. Must still be "
+                        "bit-identical: async changes WHEN the bytes reach "
+                        "disk, never what training computes.")
     p.add_argument("--verbose", action="store_true",
                    help="Show full stdout from each training subprocess")
     return p.parse_args(argv)

@@ -37,12 +37,14 @@ import json
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from checkpoint.async_writer import AsyncCheckpointWriter, clone_to_cpu
 
 DEFAULT_CHECKPOINT_DIR = os.path.join("results", "checkpoints")
 
@@ -175,6 +177,7 @@ def save_checkpoint(
     extra: Optional[Dict[str, Any]] = None,
     keep_last: int = 5,
     batch_size: Optional[int] = None,
+    writer: Optional[AsyncCheckpointWriter] = None,
 ) -> Optional[float]:
     """
     Write a resumable checkpoint. Called by every rank; only rank 0 writes.
@@ -183,8 +186,11 @@ def save_checkpoint(
     it doubles as the index of the batch to resume at. `global_step` is the
     same count across the whole run.
 
-    Returns the write duration in seconds on rank 0 (Phase 5's scheduler
-    needs to know what a checkpoint actually costs), None on other ranks.
+    Returns, on rank 0, the seconds TRAINING WAS BLOCKED -- which is what the
+    Phase 5 scheduler wants for `d`, since `d` is the cost charged against
+    training time, not the cost in absolute terms. Synchronously that is the
+    whole write. With a `writer` it is the state clone plus hand-off, and the
+    serialize/fsync happens off the training thread. None on other ranks.
     """
     # Collective — must run on every rank, before the rank-0-only early exit.
     rng_states = _gather_rng_states(rank, world_size)
@@ -224,17 +230,34 @@ def save_checkpoint(
     final_path = checkpoint_path(checkpoint_dir, global_step)
     tmp_path = final_path + ".tmp"
 
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, final_path)  # atomic on POSIX
+    def _commit(to_write: Dict[str, Any]) -> None:
+        """Serialize and publish. Identical work in both modes; the only
+        difference is which thread runs it."""
+        torch.save(to_write, tmp_path)
+        os.replace(tmp_path, final_path)  # atomic on POSIX
 
-    manifest_tmp = os.path.join(checkpoint_dir, _MANIFEST + ".tmp")
-    with open(manifest_tmp, "w") as fh:
-        json.dump({"path": final_path, "global_step": global_step,
-                   "epoch": epoch, "step_in_epoch": step_in_epoch}, fh)
-    os.replace(manifest_tmp, os.path.join(checkpoint_dir, _MANIFEST))
+        manifest_tmp = os.path.join(checkpoint_dir, _MANIFEST + ".tmp")
+        with open(manifest_tmp, "w") as fh:
+            json.dump({"path": final_path, "global_step": global_step,
+                       "epoch": epoch, "step_in_epoch": step_in_epoch}, fh)
+        os.replace(manifest_tmp, os.path.join(checkpoint_dir, _MANIFEST))
 
-    _prune(checkpoint_dir, keep_last)
+        _prune(checkpoint_dir, keep_last)
 
+    if writer is None:
+        # Synchronous path, unchanged. No clone is needed because nothing
+        # else can mutate the tensors while this thread is inside torch.save.
+        _commit(payload)
+        return time.perf_counter() - started
+
+    # Asynchronous path. The clone is mandatory, not an optimisation:
+    # payload["model"] holds references to the live parameters, and training
+    # resumes mutating them the moment this returns. See async_writer.py.
+    snapshot = clone_to_cpu(payload)
+    writer.submit(lambda: _commit(snapshot), global_step=global_step)
+
+    # Elapsed here = the clone, plus any wait for a previous write still in
+    # flight. Both are paid out of training time, so both belong in `d`.
     return time.perf_counter() - started
 
 
